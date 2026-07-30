@@ -7,7 +7,7 @@ import { BUILTIN_TARGET_NAMES } from "./constants.mjs";
 import { configPath } from "./paths.mjs";
 import { addIgnoredSkills, loadConfig, removeIgnoredSkills, removeSource, removeTarget, saveConfig, setIgnoredSkills, setSource, setTarget } from "./config.mjs";
 import { discoverSource, assertNoDuplicateNames } from "./scanner.mjs";
-import { resolveTargetNames, switchSource } from "./switcher.mjs";
+import { clearTargets, resolveTargetNames, switchSource } from "./switcher.mjs";
 import { readState } from "./state.mjs";
 import { validateName } from "./validation.mjs";
 import { askConfirm, askMultiSelect, askSelect, askText, closePrompt, createPrompt } from "./prompt.mjs";
@@ -87,6 +87,7 @@ async function runMenu() {
         { label: "添加工作流", value: "source-add" },
         { label: "添加工具目录", value: "target-add" },
         { label: "切换工作流", value: "use" },
+        { label: "清空当前工作流", value: "clear" },
         { label: "查看状态", value: "status" },
         { label: "环境诊断", value: "doctor" },
         { label: "退出", value: "exit" },
@@ -119,6 +120,10 @@ async function runMenu() {
         const sourceName = await askSelect(rl, "请选择工作流", toChoices(sourceNames));
         closePrompt(rl);
         return runUse(sourceName, { target: [] });
+      }
+      if (action === "clear") {
+        closePrompt(rl);
+        return runClear({ target: [] });
       }
       if (action === "status") printCurrent(true);
       if (action === "doctor") printDoctor(runDoctor(loadConfig(), configPath()));
@@ -168,13 +173,14 @@ function printHelp() {
       ["target list", "查看工具目录列表"],
       ["target remove <名称>", "删除工具目录配置"],
       ["use [source]", "切换工作流，不传 source 时进入选择"],
+      ["clear", "清空当前工作流关联"],
       ["current", "查看当前工具目录状态"],
       ["status", "查看配置和当前状态"],
       ["doctor", "诊断配置、路径和 symlink 权限"],
     ],
   );
   section("选项");
-  table(["选项", "说明"], [["--target <名称|all>", "指定 use 的工具目录，可重复"]]);
+  table(["选项", "说明"], [["--target <名称|all>", "指定 use 或 clear 的工具目录，可重复"]]);
 }
 
 /**
@@ -501,18 +507,19 @@ function printTargets(config) {
 }
 
 /**
- * 选择 use 命令的 target；未传 --target 且有多个 target 时进入交互选择。
+ * 选择操作目标 target；未传 --target 且有多个 target 时进入交互选择。
  * @param {object} config 配置对象。
  * @param {string[]} requested 请求 target。
+ * @param {string} message 交互选择提示。
  * @returns {Promise<string[]>} target 名称列表。
  */
-async function selectTargetsForUse(config, requested) {
+async function selectTargetsForAction(config, requested, message) {
   if (requested.length > 0) return resolveTargetNames(config, requested);
   const names = resolveTargetNames(config, []);
   if (names.length <= 1) return names;
   const rl = createPrompt();
   try {
-    return askMultiSelect(rl, "请选择要切换的工具目录", toChoices(names));
+    return askMultiSelect(rl, message, toChoices(names));
   } finally {
     closePrompt(rl);
   }
@@ -544,7 +551,7 @@ async function selectSourceForUse(config, requested) {
 async function runUse(sourceName, options) {
   const config = loadConfig();
   const selectedSourceName = await selectSourceForUse(config, sourceName);
-  const targetNames = await selectTargetsForUse(config, options.target);
+  const targetNames = await selectTargetsForAction(config, options.target, "请选择要切换的工具目录");
   if (targetNames.length === 0) throw new Error("未配置可用工具目录");
   const results = spin(`切换到工作流 ${selectedSourceName}`, () => switchSource(config, selectedSourceName, targetNames), "工作流切换完成");
   for (const result of results) {
@@ -564,6 +571,30 @@ async function runUse(sourceName, options) {
     for (const warning of result.warnings) warn(`[${result.targetName}] ${warning}`);
   }
   info("切换完成后，请新开对应智能体会话或重启客户端，让 skills 列表刷新。");
+}
+
+/**
+ * 执行 clear 命令。
+ * @param {object} options 命令选项。
+ */
+async function runClear(options) {
+  const config = loadConfig();
+  const targetNames = await selectTargetsForAction(config, options.target, "请选择要清空的工具目录");
+  if (targetNames.length === 0) throw new Error("未配置可用工具目录");
+  const results = spin("清空当前工作流关联", () => clearTargets(config, targetNames), "工作流关联已清空");
+  for (const result of results) {
+    section(`结果: ${result.targetName}`);
+    table(
+      ["项目", "结果"],
+      [
+        ["原工作流", result.previousSource || "未选择或使用工作流"],
+        ["skills 目录", pathText(result.activeDir)],
+        ["移除", result.removed.length],
+        ["已不存在", result.missing.length],
+      ],
+    );
+  }
+  info("清空完成后，请新开对应智能体会话或重启客户端，让 skills 列表刷新。");
 }
 
 /**
@@ -638,6 +669,10 @@ export async function main(argv = []) {
     }
 
     if (command === "use") return await runUse(parsed.args[0], parsed.options);
+    if (command === "clear") {
+      if (parsed.args.length > 0) throw new Error("clear 不接受位置参数，请使用 --target 指定工具目录");
+      return await runClear(parsed.options);
+    }
     if (command === "current") return printCurrent(false);
     if (command === "status") return printCurrent(true);
     if (command === "doctor") {

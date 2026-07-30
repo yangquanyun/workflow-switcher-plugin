@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { assertWritableDir, linkTarget, lstatMaybe, realpathMaybe } from "./fs-utils.mjs";
 import { discoverSource, assertNoDuplicateNames } from "./scanner.mjs";
-import { readState, toStateEntries, writeState } from "./state.mjs";
+import { clearTargetState, readState, toStateEntries, writeState } from "./state.mjs";
 import { assertSymlinkCapability, createSymlink, symlinkMatches } from "./symlink.mjs";
 import { isInsidePath } from "./paths.mjs";
 
@@ -67,6 +67,101 @@ function removeManagedSymlinks(activeDir, config, state, keepNames = new Set()) 
     removed.push(item.name);
   }
   return { removed, warnings };
+}
+
+/**
+ * 校验单个 target 的受控链接是否可以安全清空。
+ * @param {object} config 配置对象。
+ * @param {string} targetName target 名称。
+ * @returns {{targetName:string,activeDir:string,state:object,removable:Array,missing:string[]}} 清空计划。
+ */
+export function preflightClearTarget(config, targetName) {
+  const target = config.targets[targetName];
+  if (!target) throw new Error(`未知 target: ${targetName}`);
+  if (!fs.existsSync(target.activeDir)) throw new Error(`target 路径不存在: ${target.activeDir}`);
+  assertWritableDir(target.activeDir);
+
+  const state = readState(target.activeDir);
+  const entries = [...state.managed, ...state.managedRootEntries];
+  const removable = [];
+  const missing = [];
+  const seenNames = new Set();
+  const activeRoot = path.resolve(target.activeDir);
+
+  for (const item of entries) {
+    if (!item?.name || !item?.target) {
+      throw new Error(`${target.activeDir} 的状态文件包含无效受控项，已停止清空`);
+    }
+    if (seenNames.has(item.name)) {
+      throw new Error(`${target.activeDir} 的状态文件包含重复受控项 ${item.name}，已停止清空`);
+    }
+    seenNames.add(item.name);
+
+    const activePath = path.resolve(activeRoot, item.name);
+    if (path.dirname(activePath) !== activeRoot) {
+      throw new Error(`${target.activeDir} 的状态文件包含越界受控项 ${item.name}，已停止清空`);
+    }
+
+    const stat = lstatMaybe(activePath);
+    if (!stat) {
+      missing.push(item.name);
+      continue;
+    }
+    if (!stat.isSymbolicLink()) {
+      throw new Error(`${activePath} 不是本工具受控项: 当前内容不是符号链接，已停止清空`);
+    }
+
+    const currentTarget = realpathMaybe(linkTarget(activePath));
+    const expectedTarget = realpathMaybe(item.target);
+    if (!currentTarget || !expectedTarget || currentTarget !== expectedTarget) {
+      throw new Error(`${activePath} 不是本工具受控项: 当前链接目标与状态记录不一致，已停止清空`);
+    }
+    if (!isManagedTargetAllowed(item, config)) {
+      throw new Error(`${activePath} 不是本工具受控项: 当前链接目标不属于已配置 source，已停止清空`);
+    }
+    removable.push({ name: item.name, activePath });
+  }
+
+  return { targetName, activeDir: target.activeDir, state, removable, missing };
+}
+
+/**
+ * 执行已经通过预检的单 target 清空计划。
+ * @param {{targetName:string,activeDir:string,state:object,removable:Array,missing:string[]}} plan 清空计划。
+ * @returns {object} 清空结果。
+ */
+function executeClearPlan(plan) {
+  for (const item of plan.removable) fs.unlinkSync(item.activePath);
+  clearTargetState(plan.activeDir, plan.targetName);
+  return {
+    targetName: plan.targetName,
+    activeDir: plan.activeDir,
+    previousSource: plan.state.currentSource,
+    removed: plan.removable.map((item) => item.name),
+    missing: plan.missing,
+  };
+}
+
+/**
+ * 清空单个 target 当前受控工作流。
+ * @param {object} config 配置对象。
+ * @param {string} targetName target 名称。
+ * @returns {object} 清空结果。
+ */
+export function clearOneTarget(config, targetName) {
+  return executeClearPlan(preflightClearTarget(config, targetName));
+}
+
+/**
+ * 清空多个 target；先完成全部预检，避免已知冲突导致部分 target 被清空。
+ * @param {object} config 配置对象。
+ * @param {string[]} targetNames target 名称列表。
+ * @returns {Array} 清空结果列表。
+ */
+export function clearTargets(config, targetNames) {
+  const uniqueTargetNames = [...new Set(targetNames)];
+  const plans = uniqueTargetNames.map((targetName) => preflightClearTarget(config, targetName));
+  return plans.map((plan) => executeClearPlan(plan));
 }
 
 /**

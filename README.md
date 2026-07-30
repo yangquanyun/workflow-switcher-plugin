@@ -128,6 +128,18 @@ workflow-switcher use
 workflow-switcher use V5 --target codex
 ```
 
+清空当前工具目录中的受控工作流关联：
+
+```bash
+workflow-switcher clear --target codex
+```
+
+清空所有已启用工具目录中的受控工作流关联：
+
+```bash
+workflow-switcher clear --target all
+```
+
 切换到所有已启用工具目录：
 
 ```bash
@@ -309,6 +321,10 @@ Workflow Switcher 只管理自己创建并记录的软链接。
 ```
 
 后续切换时，只会清理这个状态文件中记录的受控项。如果工具目录里已经存在同名文件或目录，但不是 Workflow Switcher 管理的内容，切换会停止并提示你手动处理，避免误删。
+
+`clear` 同样只清理状态文件记录且链接目标仍可信的受控软链接，不删除工作流配置、真实源目录或手工放入工具目录的内容。清空后状态文件会保留，当前工作流重置为“未选择或使用工作流”。如果任一受控项被改成普通文件、改指向其他目录或无法确认归属，清空会在删除前停止；使用 `--target all` 时会先检查全部工具目录，避免已知冲突造成部分清空。
+
+清空完成后，请新开对应 agent 会话，或重启对应客户端，让 skills 列表刷新。
 
 ## 一键卸载
 

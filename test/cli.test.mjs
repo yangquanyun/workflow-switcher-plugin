@@ -80,3 +80,40 @@ test("workflow ignore 命令可以添加、恢复和清空忽略列表", () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("clear --target all 清理所有工具目录并重置当前工作流", { skip: process.platform === "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "workflow-switcher-cli-clear-"));
+  const configPath = path.join(root, "config.json");
+  const sourceDir = path.join(root, "source");
+  const codexDir = path.join(root, "codex");
+  const claudeDir = path.join(root, "claude");
+
+  try {
+    fs.mkdirSync(path.join(sourceDir, "coding"), { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, "coding", "SKILL.md"), "---\nname: coding\ndescription: test\n---\n");
+
+    assert.equal(runCli(["workflow", "add", "V5", sourceDir], configPath).status, 0);
+    assert.equal(runCli(["tool", "add", "codex", codexDir], configPath).status, 0);
+    assert.equal(runCli(["tool", "add", "claude", claudeDir], configPath).status, 0);
+    assert.equal(runCli(["use", "V5", "--target", "all"], configPath).status, 0);
+
+    const clearResult = runCli(["clear", "--target", "all"], configPath);
+    assert.equal(clearResult.status, 0, clearResult.stderr || clearResult.stdout);
+    assert.match(clearResult.stdout, /工作流关联已清空/);
+    assert.equal(fs.existsSync(path.join(codexDir, "coding")), false);
+    assert.equal(fs.existsSync(path.join(claudeDir, "coding")), false);
+
+    for (const activeDir of [codexDir, claudeDir]) {
+      const state = JSON.parse(fs.readFileSync(path.join(activeDir, ".workflow-switcher.json"), "utf8"));
+      assert.equal(state.currentSource, null);
+      assert.equal(state.sourceDir, null);
+      assert.deepEqual(state.managed, []);
+    }
+
+    const statusResult = runCli(["status"], configPath);
+    assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
+    assert.match(statusResult.stdout, /未选择或使用工作流/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

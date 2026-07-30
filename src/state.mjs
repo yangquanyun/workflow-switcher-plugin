@@ -51,6 +51,25 @@ export function writeState(activeDir, state) {
 }
 
 /**
+ * 把 target 状态重置为未选择工作流，并保留状态文件供后续安全管理。
+ * @param {string} activeDir target active skills 目录。
+ * @param {string} targetName target 名称。
+ * @returns {object} 已写入的空状态。
+ */
+export function clearTargetState(activeDir, targetName) {
+  const state = {
+    target: targetName,
+    currentSource: null,
+    sourceDir: null,
+    updatedAt: new Date().toISOString(),
+    managed: [],
+    managedRootEntries: [],
+  };
+  writeState(activeDir, state);
+  return state;
+}
+
+/**
  * 把投影条目转换成状态文件条目。
  * @param {Array} entries 投影条目。
  * @returns {Array} 状态条目。

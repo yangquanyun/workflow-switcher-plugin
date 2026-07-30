@@ -33,6 +33,7 @@ export const RESERVED_NAMES = new Set([
   "target",
   "tool",
   "use",
+  "clear",
   "current",
   "status",
   "doctor",
