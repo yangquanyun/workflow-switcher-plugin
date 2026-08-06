@@ -29,44 +29,61 @@ export function resolveTargetNames(config, requested = []) {
  * @returns {boolean} 是否允许清理。
  */
 function isManagedTargetAllowed(item, config) {
-  const expected = realpathMaybe(item.target);
-  if (!expected) return false;
+  const expectedPath = path.resolve(item.target);
+  const expectedRealPath = realpathMaybe(expectedPath);
   return Object.values(config.sources).some((source) => {
-    const sourceRoot = realpathMaybe(source.skillsDir);
-    return sourceRoot && isInsidePath(expected, sourceRoot);
+    const sourcePath = path.resolve(source.skillsDir);
+    const sourceRealPath = realpathMaybe(sourcePath);
+    if (expectedRealPath && sourceRealPath) return isInsidePath(expectedRealPath, sourceRealPath);
+    // Skill 被删除或移动后目标可能已经不存在，此时仍需按记录路径确认它属于已配置 source。
+    return isInsidePath(expectedPath, sourcePath);
   });
 }
 
 /**
- * 清理上一次状态文件记录的受控 symlink。
+ * 判断磁盘 symlink 的原始目标是否与状态记录一致。
+ * @param {string} activePath symlink 路径。
+ * @param {string} expectedTarget 状态记录的目标路径。
+ * @returns {boolean} 是否一致。
+ */
+function managedLinkMatchesState(activePath, expectedTarget) {
+  const currentTarget = linkTarget(activePath);
+  if (!currentTarget || !expectedTarget) return false;
+  // 比较规范化后的原始路径，使目标已删除形成断链时仍可验证归属。
+  return path.resolve(currentTarget) === path.resolve(expectedTarget);
+}
+
+/**
+ * 预检上一次状态文件记录的受控 symlink，保证全部安全后再执行删除。
  * @param {string} activeDir target active skills 目录。
  * @param {object} config 配置对象。
  * @param {object} state target 状态。
  * @param {Set<string>} keepNames 本次无需删除的名称。
- * @returns {{removed:string[],warnings:string[]}} 清理结果。
+ * @returns {Array<{name:string,activePath:string}>} 可安全删除的条目。
  */
-function removeManagedSymlinks(activeDir, config, state, keepNames = new Set()) {
-  const removed = [];
-  const warnings = [];
+function preflightManagedSymlinkRemoval(activeDir, config, state, keepNames = new Set()) {
+  const removable = [];
+  const activeRoot = path.resolve(activeDir);
   for (const item of [...state.managed, ...state.managedRootEntries]) {
     if (!item?.name || keepNames.has(item.name)) continue;
-    const activePath = path.join(activeDir, item.name);
+    const activePath = path.resolve(activeRoot, item.name);
+    if (path.dirname(activePath) !== activeRoot) {
+      throw new Error(`${activeDir} 的状态文件包含越界受控项 ${item.name}，已停止切换`);
+    }
     const stat = lstatMaybe(activePath);
     if (!stat) continue;
     if (!stat.isSymbolicLink()) {
-      warnings.push(`跳过 ${activePath}: 不是符号链接`);
-      continue;
+      throw new Error(`${activePath} 不是本工具受控项: 当前内容不是符号链接，已停止切换`);
     }
-    const currentTarget = realpathMaybe(linkTarget(activePath));
-    if (currentTarget !== realpathMaybe(item.target) || !isManagedTargetAllowed(item, config)) {
-      warnings.push(`跳过 ${activePath}: 当前链接目标不属于受控 source`);
-      continue;
+    if (!managedLinkMatchesState(activePath, item.target)) {
+      throw new Error(`${activePath} 不是本工具受控项: 当前链接目标与状态记录不一致，已停止切换`);
     }
-    // 只删除状态文件记录且目标仍可信的 symlink，避免误删用户文件。
-    fs.unlinkSync(activePath);
-    removed.push(item.name);
+    if (!isManagedTargetAllowed(item, config)) {
+      throw new Error(`${activePath} 不是本工具受控项: 状态记录目标不属于已配置 source，已停止切换`);
+    }
+    removable.push({ name: item.name, activePath });
   }
-  return { removed, warnings };
+  return removable;
 }
 
 /**
@@ -111,9 +128,7 @@ export function preflightClearTarget(config, targetName) {
       throw new Error(`${activePath} 不是本工具受控项: 当前内容不是符号链接，已停止清空`);
     }
 
-    const currentTarget = realpathMaybe(linkTarget(activePath));
-    const expectedTarget = realpathMaybe(item.target);
-    if (!currentTarget || !expectedTarget || currentTarget !== expectedTarget) {
+    if (!managedLinkMatchesState(activePath, item.target)) {
       throw new Error(`${activePath} 不是本工具受控项: 当前链接目标与状态记录不一致，已停止清空`);
     }
     if (!isManagedTargetAllowed(item, config)) {
@@ -178,10 +193,8 @@ function assertNoUnmanagedConflicts(activeDir, desiredEntries, state) {
     if (!stat) continue;
     if (symlinkMatches(activePath, entry.target)) continue;
     const managedItem = managedByName.get(entry.name);
-    const currentTarget = stat.isSymbolicLink() ? realpathMaybe(linkTarget(activePath)) : null;
-    const expectedTarget = managedItem ? realpathMaybe(managedItem.target) : null;
-    // 只有磁盘链接仍指向状态文件记录的目标时，才允许后续清理并重建。
-    if (managedItem && currentTarget && expectedTarget && currentTarget === expectedTarget) continue;
+    // 目标已删除形成断链时，仍按软链接原始目标与状态记录判断是否受控。
+    if (managedItem && stat.isSymbolicLink() && managedLinkMatchesState(activePath, managedItem.target)) continue;
     throw new Error(`${activePath} 已存在且不是本工具受控项，请先手动处理`);
   }
 }
@@ -206,7 +219,13 @@ export function preflightSwitch(sourceName, source, targetName, target, config) 
   assertSymlinkCapability(target.activeDir);
   const state = readState(target.activeDir);
   assertNoUnmanagedConflicts(target.activeDir, discovered.entries, state);
-  return { discovered, state };
+  const keepNames = new Set(
+    discovered.entries
+      .filter((entry) => symlinkMatches(path.join(target.activeDir, entry.name), entry.target))
+      .map((entry) => entry.name),
+  );
+  const removable = preflightManagedSymlinkRemoval(target.activeDir, config, state, keepNames);
+  return { discovered, state, keepNames, removable };
 }
 
 /**
@@ -219,14 +238,10 @@ export function preflightSwitch(sourceName, source, targetName, target, config) 
 export function switchOneTarget(config, sourceName, targetName) {
   const source = config.sources[sourceName];
   const target = config.targets[targetName];
-  const { discovered, state } = preflightSwitch(sourceName, source, targetName, target, config);
+  const { discovered, keepNames, removable } = preflightSwitch(sourceName, source, targetName, target, config);
   const desiredNames = new Set(discovered.entries.map((entry) => entry.name));
-  const keepNames = new Set(
-    discovered.entries
-      .filter((entry) => symlinkMatches(path.join(target.activeDir, entry.name), entry.target))
-      .map((entry) => entry.name),
-  );
-  const removal = removeManagedSymlinks(target.activeDir, config, state, keepNames);
+  // 预检全部通过后才统一删除旧链接，避免失败时留下部分切换状态。
+  for (const item of removable) fs.unlinkSync(item.activePath);
   const created = [];
 
   for (const entry of discovered.entries) {
@@ -255,10 +270,10 @@ export function switchOneTarget(config, sourceName, targetName) {
     activeDir: target.activeDir,
     skills: discovered.skills.length,
     rootAdjuncts: discovered.rootAdjuncts.length,
-    removed: removal.removed,
+    removed: removable.map((item) => item.name),
     created,
     unchanged: [...keepNames].filter((name) => desiredNames.has(name)),
-    warnings: removal.warnings,
+    warnings: [],
   };
 }
 
